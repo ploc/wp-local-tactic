@@ -116,10 +116,8 @@ let extract_tactic annot =
 let call_provers () =
   Annotations.iter_all_code_annot
     (
-      fun stmt _ rooted_annot -> 
+      fun stmt _ annot -> 
 	let kf = Kernel_function.find_englobing_kf stmt in
-	match rooted_annot with
-	  | User annot -> (
 	    let tactic_opt = extract_tactic annot in
 	    match tactic_opt with
 		Some tactic ->
@@ -127,8 +125,6 @@ let call_provers () =
 		  set_tactic tactic;
 		  List.iter (wp_compute_ip) ips
 	      | None -> () (* We only deal with our grammar extension annotations *)
-	  )
-	  | AI _ -> () (* We only deal with User annot *)
     )
  
 	
