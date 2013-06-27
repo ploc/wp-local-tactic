@@ -61,35 +61,30 @@ let wp_compute_ip =
     (Datatype.func Property.ty Datatype.unit)
 
 (* Registering tactic_term as the default strategy to be use *)
-let set_tactic tactic_term =
-  match tactic_term.term_node with
-    | TDataCons (ctor, []) -> (
-      (* Only allow enum const without args *)
-      try
-	let tactic_name = List.assoc ctor.ctor_name strategy_assoc_table in
-	Dynamic.Parameter.String.set "-wp-tactic" tactic_name	
-      with Not_found -> 
-	Self.warning 
-	  "Tactic %s doesn't seem to be declared. Switching to default strategy." 
-	  ctor.ctor_name
-    )
-    | _ -> (* Otherwise: do nothing *)
-      ()
-
+let set_tactic tactic_string =
+  try
+    let tactic_name = List.assoc tactic_string strategy_assoc_table in
+    Dynamic.Parameter.String.set "-wp-tactic" tactic_name	
+  with Not_found -> 
+    Self.warning 
+      "Tactic %s doesn't seem to be declared. Switching to default strategy." 
+      tactic_string
+ 
 let extract_tactic annot =
   match annot.annot_content with 
     | AStmtSpec (_, spec) -> (
       (* We iterate through grammar extensions. Only one of our kind is
 	 allowed. In practice only the first is parsed. *)
-      List.fold_left (fun res beh ->
-	match res, beh.b_extended with
-	  | Some _, _ -> res
-	  | None, [s, i, [p]]  
-	    when grammar_extension_kwd = s 
-	    && grammar_extension_id = i
-	      -> (
-		match p.ip_content with
-		  | Papp (logic_info_, _, [term]) 
+      let tactic_term = 
+	List.fold_left (fun res beh ->
+	  match res, beh.b_extended with
+	    | Some _, _ -> res
+	    | None, [s, i, [p]]  
+	      when grammar_extension_kwd = s 
+	      && grammar_extension_id = i
+		-> (
+		  match p.ip_content with
+		    | Papp (logic_info_, _, [term]) 
 		      when
 			logic_info_.l_var_info.lv_name 
 			= grammar_extension_strategy_predicate ->
@@ -109,8 +104,21 @@ let extract_tactic annot =
 	     argument) or not our extension *)
 	  | _ -> None 
       ) None spec.spec_behavior
+      in
+      match tactic_term with
+	| Some (tt) -> ( 
+	  match tt.term_node with
+	    | TDataCons (ctor, []) -> 
+	      (* Only allow enum const without args *)
+	      Some ctor.ctor_name
+	    | _ -> None
+	)
+	| _ -> None
     )
     | _ -> None (* Not an stmt spec *)
+
+let extract_tactic = 
+  Dynamic.register ~plugin:"local-tactic" "extract_tactic" ~journalize:false (Datatype.func Cil_datatype.Code_annotation.ty (Datatype.option Datatype.string)) extract_tactic
       
 (* We only iterate through code annot (and not funspec) *)
 let call_provers () =
