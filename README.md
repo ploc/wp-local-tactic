@@ -107,8 +107,9 @@ at the end of this document.
 ```console
 $ frama-c -wp -local-tactic test.c -then -report
 ...
-  Coq 9.1.1:       2 (186ms)
+  Coq 9.1.1:       3 (190ms)
 ...
+[  Valid  ] Lemma 'sq_nonneg_lemma'
 [  Valid  ] Post-condition 'sq_nonneg'
 [  Valid  ] Post-condition 'sq_nonneg2'
 ```
@@ -163,6 +164,32 @@ post-condition label to apply it to that one only:
 ```
 
 Without a label, the script is used for every `ensures` of the contract.
+
+### `rocq_proof` — attach a script to a lemma
+
+A `lemma` (or `axiom`) is not a contract, so it has no clause to hang a script
+on. Instead, a **global** `rocq_proof` annotation names the lemma:
+
+```c
+/*@ lemma sq_nonneg: \forall integer k; k * k >= 0; */
+/*@ rocq_proof sq_nonneg: "intros k. apply ZArith.BinInt.Z.square_nonneg." ; */
+
+/*@ axiomatic Reals {
+  @   lemma sq_nonneg_r: \forall real x; x * x >= 0.0;
+  @ }
+*/
+/*@ rocq_proof sq_nonneg_r: \by(SquareNonNeg) ; */
+```
+
+`rocq_proof` takes a string literal or `\by(Name)`, exactly like `rocq_script`.
+Lemmas anywhere in the file are matched by name, including inside an `axiomatic`
+or `module`; an unknown name is warned and skipped. (The keyword is `rocq_proof`
+rather than `rocq_script` because ACSL will not let one extension keyword be used
+at two grammar levels — contract clause *and* global annotation.)
+
+Lemmas are the cleanest target: WP emits exactly one proof obligation per lemma,
+stated as the ACSL predicate itself, with none of the machine-integer or
+`\at`-label hypotheses a contract obligation carries.
 
 ### Options
 
@@ -227,9 +254,10 @@ How it executes
 
 `-local-tactic` registers a Frama-C main action. If `-wp` is also on the command
 line it runs first; either way the plug-in then drives WP's obligation generator
-and prover interface directly. For each contract carrying a `rocq_script`
-(resolving `\by(Name)` against the declared recipes, and filtering by label if
-present) it collects the targeted `ensures` properties, then:
+and prover interface directly. It collects its targets — the `ensures` properties
+of every contract carrying a `rocq_script` (filtered by label if present), and
+every lemma named by a `rocq_proof`, with `\by(Name)` resolved against the
+declared `rocq_strategy` recipes — then:
 
 **0. Save and override WP options.** It records and later restores
 `-wp-prover`, `-wp-interactive` and `-wp-status-valid`. It sets the prover to
@@ -276,6 +304,9 @@ Limitations
 * Pass 1 spends one (failing) `coqc` invocation per goal on the stub.
 * One `rocq_script` per behavior; use several behaviors, or several contracts, for
   per-clause scripts beyond the single `label:` selector.
+* `rocq_proof` targets `lemma` / `axiom` by name (contract post-conditions use
+  `rocq_script`); there is currently no name-based binding for a post-condition
+  declared in another part of the file.
 
 
 Background: what changed from the 2013 version

@@ -93,6 +93,9 @@ type script = {
 (* [rocq_script] extension id -> parsed script *)
 let scripts : (int, script) Hashtbl.t = Hashtbl.create 7
 
+(* [rocq_proof <lemma>: ...] extension id -> (lemma name, script) *)
+let proofs : (int, string * script_body) Hashtbl.t = Hashtbl.create 7
+
 let fresh_id = let c = ref 0 in fun () -> incr c ; !c
 
 (* -------------------------------------------------------------------------- *)
@@ -123,7 +126,27 @@ let rocq_strategy_typer (ctxt : Logic_typing.typing_context) loc lexprs =
     ctxt.error loc
       "expecting 'Name: \"<rocq script>\"' after \\local-tactic::rocq_strategy"
 
-(* [rocq_script [label:] ( "ltac" | \by(Name) );] *)
+(* parse a script body: a string literal, or [\by(Name)] *)
+let parse_body (ctxt : Logic_typing.typing_context) ~kw loc lexprs =
+  let open Logic_ptree in
+  match lexprs with
+  | [ { lexpr_node =
+          PLapp ("\\by", [], [ { lexpr_node = PLvar n; _ } ]); _ } ] -> Ref n
+  | [ { lexpr_node = PLapp ("\\by", [], [ arg ]); _ } ] ->
+    (match as_string arg with
+     | Some n -> Ref n
+     | None -> ctxt.error loc "\\by(...) expects a recipe name")
+  | [ single ] ->
+    (match as_string single with
+     | Some s -> Inline s
+     | None ->
+       ctxt.error loc
+         "%s expects a Rocq script string literal or \\by(Name)" kw)
+  | _ ->
+    ctxt.error loc
+      "%s expects a single Rocq script string literal or \\by(Name)" kw
+
+(* [rocq_script [label:] ( "ltac" | \by(Name) );] -- on a contract *)
 let rocq_script_typer (ctxt : Logic_typing.typing_context) loc lexprs =
   let open Logic_ptree in
   let label, rest =
@@ -131,28 +154,23 @@ let rocq_script_typer (ctxt : Logic_typing.typing_context) loc lexprs =
     | { lexpr_node = PLnamed (l, p); _ } :: tl -> Some l, p :: tl
     | l -> None, l
   in
-  let body =
-    match rest with
-    | [ { lexpr_node =
-            PLapp ("\\by", [], [ { lexpr_node = PLvar n; _ } ]); _ } ] -> Ref n
-    | [ { lexpr_node =
-            PLapp ("\\by", [], [ arg ]); _ } ] ->
-      (match as_string arg with
-       | Some n -> Ref n
-       | None -> ctxt.error loc "\\by(...) expects a recipe name")
-    | [ single ] ->
-      (match as_string single with
-       | Some s -> Inline s
-       | None ->
-         ctxt.error loc
-           "rocq_script expects a Rocq script string literal or \\by(Name)")
-    | _ ->
-      ctxt.error loc
-        "rocq_script expects a single Rocq script string literal or \\by(Name)"
-  in
+  let body = parse_body ctxt ~kw:"rocq_script" loc rest in
   let id = fresh_id () in
   Hashtbl.replace scripts id { label ; body } ;
   Ext_id id
+
+(* [rocq_proof <lemma>: ( "ltac" | \by(Name) );] -- global, targets a lemma *)
+let rocq_proof_typer (ctxt : Logic_typing.typing_context) loc lexprs =
+  let open Logic_ptree in
+  match lexprs with
+  | { lexpr_node = PLnamed (lemma, p); _ } :: tl ->
+    let body = parse_body ctxt ~kw:"rocq_proof" loc (p :: tl) in
+    let id = fresh_id () in
+    Hashtbl.replace proofs id (lemma, body) ;
+    Ext_id id
+  | _ ->
+    ctxt.error loc
+      "expecting '<lemma>: ( \"<rocq script>\" | \\by(Name) )' after rocq_proof"
 
 let pp_script_kind fmt = function
   | Ext_id id ->
@@ -165,6 +183,10 @@ let pp_script_kind fmt = function
      | None -> ())
   | _ -> ()
 
+let pp_body fmt = function
+  | Inline s -> Format.fprintf fmt "%S" s
+  | Ref n -> Format.fprintf fmt "\\by(%s)" n
+
 let pp_strategy_kind fmt = function
   | Ext_id id ->
     (match Hashtbl.find_opt strategy_decls id with
@@ -172,10 +194,21 @@ let pp_strategy_kind fmt = function
      | None -> ())
   | _ -> ()
 
+let pp_proof_kind fmt = function
+  | Ext_id id ->
+    (match Hashtbl.find_opt proofs id with
+     | Some (lemma, body) -> Format.fprintf fmt "%s: %a" lemma pp_body body
+     | None -> ())
+  | _ -> ()
+
 let () =
   Acsl_extension.register_global ~plugin:"local-tactic" "rocq_strategy"
     rocq_strategy_typer
     ~printer:(fun _ fmt k -> pp_strategy_kind fmt k)
+    false ;
+  Acsl_extension.register_global ~plugin:"local-tactic" "rocq_proof"
+    rocq_proof_typer
+    ~printer:(fun _ fmt k -> pp_proof_kind fmt k)
     false ;
   Acsl_extension.register_behavior ~plugin:"local-tactic" "rocq_script"
     rocq_script_typer
@@ -344,6 +377,36 @@ let collect_targets () =
       match Annotations.funspec kf with
       | spec -> scan_spec kf Kglobal spec
       | exception Not_found -> ()) ;
+  (* lemmas, via [rocq_proof <lemma>: ...] global annotations *)
+  if Hashtbl.length proofs > 0 then begin
+    let wanted = Hashtbl.create 7 in
+    Hashtbl.iter (fun _ (lemma, body) -> Hashtbl.replace wanted lemma (body, ref false)) proofs ;
+    (* [iter_global] does not descend into axiomatics/modules -- do it here *)
+    let rec visit g =
+      match g with
+      | Daxiomatic (_, gs, _, _) | Dmodule (_, gs, _, _, _) -> List.iter visit gs
+      | Dlemma (name, _, _, _, _, _) ->
+        (match Hashtbl.find_opt wanted name with
+         | None -> ()
+         | Some (body, seen) ->
+           seen := true ;
+           (match resolve_body body with
+            | None -> ()
+            | Some ltac ->
+              List.iter
+                (fun ip -> match ip with
+                   | Property.IPLemma _ -> out := (ip, ltac) :: !out
+                   | _ -> ())
+                (Property.ip_of_global_annotation g)))
+      | _ -> ()
+    in
+    Annotations.iter_global (fun _ g -> visit g) ;
+    Hashtbl.iter
+      (fun lemma (_, seen) ->
+         if not !seen then
+           Self.warning "rocq_proof: no lemma named '%s' (skipped)" lemma)
+      wanted
+  end ;
   !out
 
 let run_pipeline () =

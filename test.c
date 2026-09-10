@@ -29,3 +29,8 @@ void recipe_example(void)
 {
   return;
 }
+
+/* A lemma has no contract clause, so it is targeted by a global 'rocq_proof'
+ * that names it (see also examples/lemmas.c). */
+/*@ lemma sq_nonneg_lemma: \forall integer k; k * k >= 0; */
+/*@ rocq_proof sq_nonneg_lemma: \by(SquareNonNeg) ; */
