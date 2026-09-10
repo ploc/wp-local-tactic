@@ -1,0 +1,24 @@
+opam-version: "2.0"
+synopsis: "Frama-C/WP plugin: integrated Rocq (Coq) proofs from ACSL annotations"
+description: """
+LocalTactics lets an ACSL contract clause carry an inline Rocq/Coq proof script
+(rocq_script: "..."), or reference a named script recipe registered with the
+local-tactic::rocq_strategy global annotation. On -local-tactic, the plugin
+drives WP's Why3 -> Coq interactive backend automatically: it generates the
+proof obligation's .v file, splices in the script and any libraries requested
+with -local-tactic-rocq-import, runs coqc, and reports the verdict through WP.
+"""
+maintainer: "ploc@garoche.net"
+authors: ["Pierre-Loïc Garoche <ploc@garoche.net> (ENAC)"]
+homepage: "https://github.com/ploc/wp-local-tactic"
+bug-reports: "https://github.com/ploc/wp-local-tactic/issues"
+license: "LGPL-2.1-only"
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+]
+depends: [
+  "ocaml" {>= "4.14"}
+  "dune" {>= "3.13"}
+  "dune-site" {>= "3.13"}
+  "frama-c" {>= "32.0" & < "33.0~"}
+]

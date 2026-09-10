@@ -1,26 +1,31 @@
-/*@ axiomatic ellipsoids_proof_tactics {
-  @   type ellipsoids_tactics = Intuition | Tactic2;
-  @   predicate use_strategy (ellipsoids_tactics t);
-  @ }
-*/
+/* Demonstration of the LocalTactics plugin.
+ *
+ *   frama-c -wp -local-tactic test.c
+ *
+ * Each 'rocq_script' clause carries a Rocq/Coq proof script that the plugin
+ * splices into the proof obligation's generated .v file (under
+ * .frama-c/wp/interactive/), then discharges with coqc through WP.
+ */
 
-/*@ requires x < 0;
-  @ ensures \result <= 0; 
+/*@ ensures sq_nonneg: \forall integer k; k * k >= 0;
+  @ assigns \nothing;
+  @ rocq_script "intros k. apply ZArith.BinInt.Z.square_nonneg." ;
 */
-int plus_one (int x) {
-int y,z;
-/*@ ensures y <= 0; 
-  @ PROOF_TACTIC (use_strategy (Intuition));
-*/
+void inline_example(void)
 {
-y = x + 1;
-}
-/*@ ensures z <= 0; 
-  @ PROOF_TACTIC (use_strategy (Tactic2));
-*/
-{
-z = 2 * y;
-}
-return z;
+  return;
 }
 
+/* A named recipe, declared once and referenced by \by(...). */
+/*@ rocq_strategy SquareNonNeg:
+      "intros k. apply ZArith.BinInt.Z.square_nonneg." ;
+*/
+
+/*@ ensures sq_nonneg2: \forall integer k; k * k >= 0;
+  @ assigns \nothing;
+  @ rocq_script \by(SquareNonNeg) ;
+*/
+void recipe_example(void)
+{
+  return;
+}
