@@ -21,6 +21,8 @@ module VC = Wp.VC
 module Wpo = Wp.Wpo
 module Why3Provers = Wp.Why3Provers
 module Wp_parameters = Wp.Wp_parameters
+module Lang = Wp.Lang
+module Conditions = Wp.Conditions
 
 (* -------------------------------------------------------------------------- *)
 (* --- Plugin declaration                                                --- *)
@@ -75,15 +77,21 @@ module Prover =
 (* --- Registries populated at typing time                               --- *)
 (* -------------------------------------------------------------------------- *)
 
-(* Named recipes: [\local-tactic::rocq_strategy Name: "ltac";] *)
+(* Named recipes: [\local-tactic::rocq_strategy Name: "ltac", "ltac2", ...;] *)
 let recipes : (string, string) Hashtbl.t = Hashtbl.create 7
 
 (* extension id -> (recipe name, script) -- kept for pretty-printing *)
 let strategy_decls : (int, string * string) Hashtbl.t = Hashtbl.create 7
 
-type script_body =
-  | Inline of string    (* literal Ltac script *)
+(* one element of a (possibly multi-line) script: a literal Rocq chunk -- a
+   genuine tactic, or a bare "(* ... *)" comment for readability -- or a
+   reference to a named [rocq_strategy] recipe. Segments are concatenated
+   with "\n" once resolved. *)
+type segment =
+  | Lit of string
   | Ref of string       (* \by(Name) -- reference to a named recipe *)
+
+type script_body = segment list
 
 type script = {
   label : string option;  (* optional property-name filter *)
@@ -95,6 +103,12 @@ let scripts : (int, script) Hashtbl.t = Hashtbl.create 7
 
 (* [rocq_proof <lemma>: ...] extension id -> (lemma name, script) *)
 let proofs : (int, string * script_body) Hashtbl.t = Hashtbl.create 7
+
+(* [rocq_alias <lemma>: "Name";] extension id -> (lemma name, Rocq alias) *)
+let aliases : (string, string) Hashtbl.t = Hashtbl.create 7
+let alias_decls : (int, string * string) Hashtbl.t = Hashtbl.create 7
+(* reverse map: alias -> lemma, to catch two lemmas claiming the same alias *)
+let alias_owner : (string, string) Hashtbl.t = Hashtbl.create 7
 
 let fresh_id = let c = ref 0 in fun () -> incr c ; !c
 
@@ -108,45 +122,66 @@ let as_string : Logic_ptree.lexpr -> string option =
   | { lexpr_node = PLconstant (StringConstant s); _ } -> Some s
   | _ -> None
 
-(* [\local-tactic::rocq_strategy Name: "ltac script";] *)
+let is_ident_start c =
+  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_'
+let is_ident_char c = is_ident_start c || (c >= '0' && c <= '9') || c = '\''
+
+let valid_coq_ident s =
+  s <> "" && is_ident_start s.[0] &&
+  String.for_all is_ident_char s
+
+(* [\local-tactic::rocq_strategy Name: "line1", "line2", ...;] -- each
+   string is one line of the recipe, joined with "\n" *)
 let rocq_strategy_typer (ctxt : Logic_typing.typing_context) loc lexprs =
   let open Logic_ptree in
   match lexprs with
-  | [ { lexpr_node = PLnamed (name, body); _ } ] ->
-    (match as_string body with
-     | Some s ->
-       Hashtbl.replace recipes name s ;
-       let id = fresh_id () in
-       Hashtbl.replace strategy_decls id (name, s) ;
-       Ext_id id
-     | None ->
-       ctxt.error loc
-         "rocq_strategy '%s' expects a Rocq script string literal" name)
+  | { lexpr_node = PLnamed (name, first); _ } :: rest ->
+    let line e =
+      match as_string e with
+      | Some s -> s
+      | None ->
+        ctxt.error loc
+          "rocq_strategy '%s' expects Rocq script string literals" name
+    in
+    let s = String.concat "\n" (List.map line (first :: rest)) in
+    Hashtbl.replace recipes name s ;
+    let id = fresh_id () in
+    Hashtbl.replace strategy_decls id (name, s) ;
+    Ext_id id
   | _ ->
     ctxt.error loc
-      "expecting 'Name: \"<rocq script>\"' after \\local-tactic::rocq_strategy"
+      "expecting 'Name: \"<rocq script>\", ...' after \\local-tactic::rocq_strategy"
 
-(* parse a script body: a string literal, or [\by(Name)] *)
-let parse_body (ctxt : Logic_typing.typing_context) ~kw loc lexprs =
+(* parse one segment of a script body: a string literal (a tactic, or a bare
+   "(* ... *)" comment), or [\by(Name)] *)
+let parse_segment (ctxt : Logic_typing.typing_context) ~kw loc lexpr =
   let open Logic_ptree in
-  match lexprs with
-  | [ { lexpr_node =
-          PLapp ("\\by", [], [ { lexpr_node = PLvar n; _ } ]); _ } ] -> Ref n
-  | [ { lexpr_node = PLapp ("\\by", [], [ arg ]); _ } ] ->
+  match lexpr with
+  | { lexpr_node = PLapp ("\\by", [], [ { lexpr_node = PLvar n; _ } ]); _ } ->
+    Ref n
+  | { lexpr_node = PLapp ("\\by", [], [ arg ]); _ } ->
     (match as_string arg with
      | Some n -> Ref n
      | None -> ctxt.error loc "\\by(...) expects a recipe name")
-  | [ single ] ->
+  | single ->
     (match as_string single with
-     | Some s -> Inline s
+     | Some s -> Lit s
      | None ->
        ctxt.error loc
          "%s expects a Rocq script string literal or \\by(Name)" kw)
-  | _ ->
-    ctxt.error loc
-      "%s expects a single Rocq script string literal or \\by(Name)" kw
 
-(* [rocq_script [label:] ( "ltac" | \by(Name) );] -- on a contract *)
+(* a script body is one or more segments -- string literals and/or
+   [\by(Name)] -- concatenated with "\n" once resolved. Writing several
+   short strings, one per line, lets a script carry Rocq "(* ... *)"
+   comments between tactics without cramming everything on one line. *)
+let parse_body (ctxt : Logic_typing.typing_context) ~kw loc lexprs =
+  match lexprs with
+  | [] ->
+    ctxt.error loc
+      "%s expects at least one Rocq script string literal or \\by(Name)" kw
+  | l -> List.map (parse_segment ctxt ~kw loc) l
+
+(* [rocq_script [label:] ( "ltac", ... | \by(Name) );] -- on a contract *)
 let rocq_script_typer (ctxt : Logic_typing.typing_context) loc lexprs =
   let open Logic_ptree in
   let label, rest =
@@ -159,7 +194,8 @@ let rocq_script_typer (ctxt : Logic_typing.typing_context) loc lexprs =
   Hashtbl.replace scripts id { label ; body } ;
   Ext_id id
 
-(* [rocq_proof <lemma>: ( "ltac" | \by(Name) );] -- global, targets a lemma *)
+(* [rocq_proof <lemma>: ( "ltac", ... | \by(Name) );] -- global, targets a
+   lemma *)
 let rocq_proof_typer (ctxt : Logic_typing.typing_context) loc lexprs =
   let open Logic_ptree in
   match lexprs with
@@ -170,22 +206,53 @@ let rocq_proof_typer (ctxt : Logic_typing.typing_context) loc lexprs =
     Ext_id id
   | _ ->
     ctxt.error loc
-      "expecting '<lemma>: ( \"<rocq script>\" | \\by(Name) )' after rocq_proof"
+      "expecting '<lemma>: ( \"<rocq script>\", ... | \\by(Name) )' after \
+       rocq_proof"
+
+(* [rocq_alias <lemma>: "Name";] -- global; declares a short Rocq name for
+   the axiom WP emits for [lemma] ('Q_<lemma>', see [Wp.Lang.lemma_id])
+   wherever that axiom shows up in a generated .v *)
+let rocq_alias_typer (ctxt : Logic_typing.typing_context) loc lexprs =
+  let open Logic_ptree in
+  match lexprs with
+  | [ { lexpr_node = PLnamed (lemma, body); _ } ] ->
+    (match as_string body with
+     | Some alias ->
+       if not (valid_coq_ident alias) then
+         ctxt.error loc
+           "rocq_alias '%s': '%s' is not a valid Rocq identifier" lemma alias ;
+       (match Hashtbl.find_opt alias_owner alias with
+        | Some other when other <> lemma ->
+          ctxt.error loc
+            "rocq_alias '%s': alias '%s' is already used for lemma '%s'"
+            lemma alias other
+        | _ -> ()) ;
+       Hashtbl.replace aliases lemma alias ;
+       Hashtbl.replace alias_owner alias lemma ;
+       let id = fresh_id () in
+       Hashtbl.replace alias_decls id (lemma, alias) ;
+       Ext_id id
+     | None ->
+       ctxt.error loc "rocq_alias '%s' expects a Rocq identifier string" lemma)
+  | _ ->
+    ctxt.error loc "expecting '<lemma>: \"<RocqName>\"' after rocq_alias"
+
+let pp_segment fmt = function
+  | Lit s -> Format.fprintf fmt "%S" s
+  | Ref n -> Format.fprintf fmt "\\by(%s)" n
+
+let pp_body fmt segs =
+  Format.pp_print_list ~pp_sep:(fun fmt () -> Format.fprintf fmt ",@ ")
+    pp_segment fmt segs
 
 let pp_script_kind fmt = function
   | Ext_id id ->
     (match Hashtbl.find_opt scripts id with
      | Some { label ; body } ->
        (match label with Some l -> Format.fprintf fmt "%s: " l | None -> ()) ;
-       (match body with
-        | Inline s -> Format.fprintf fmt "%S" s
-        | Ref n -> Format.fprintf fmt "\\by(%s)" n)
+       pp_body fmt body
      | None -> ())
   | _ -> ()
-
-let pp_body fmt = function
-  | Inline s -> Format.fprintf fmt "%S" s
-  | Ref n -> Format.fprintf fmt "\\by(%s)" n
 
 let pp_strategy_kind fmt = function
   | Ext_id id ->
@@ -201,6 +268,13 @@ let pp_proof_kind fmt = function
      | None -> ())
   | _ -> ()
 
+let pp_alias_kind fmt = function
+  | Ext_id id ->
+    (match Hashtbl.find_opt alias_decls id with
+     | Some (lemma, alias) -> Format.fprintf fmt "%s: %S" lemma alias
+     | None -> ())
+  | _ -> ()
+
 let () =
   Acsl_extension.register_global ~plugin:"local-tactic" "rocq_strategy"
     rocq_strategy_typer
@@ -209,6 +283,10 @@ let () =
   Acsl_extension.register_global ~plugin:"local-tactic" "rocq_proof"
     rocq_proof_typer
     ~printer:(fun _ fmt k -> pp_proof_kind fmt k)
+    false ;
+  Acsl_extension.register_global ~plugin:"local-tactic" "rocq_alias"
+    rocq_alias_typer
+    ~printer:(fun _ fmt k -> pp_alias_kind fmt k)
     false ;
   Acsl_extension.register_behavior ~plugin:"local-tactic" "rocq_script"
     rocq_script_typer
@@ -293,6 +371,178 @@ let splice ~imports ~ltac (content : string) : string option =
               sub_from content rest_start ])          (* trailing, if any *)
   with Not_found -> None
 
+(* true if [id] occurs in [hay] as a standalone identifier (not as part of
+   a longer one) *)
+let contains_ident hay id =
+  let n = String.length id and h = String.length hay in
+  if n = 0 then false else
+    let rec loop i =
+      if i + n > h then false
+      else
+        let before_ok = i = 0 || not (is_ident_char hay.[i - 1]) in
+        let after_ok = i + n = h || not (is_ident_char hay.[i + n]) in
+        if before_ok && after_ok && String.sub hay i n = id then true
+        else loop (i + 1)
+    in
+    loop 0
+
+(* [rocq_alias <lemma>: "Name"] declarations whose target axiom
+   ('Q_<lemma>', see [Wp.Lang.lemma_id]) is actually present in [content] --
+   as a "Notation Name := Q_<lemma>." line per hit, marking [seen] so unused
+   aliases can be reported once the whole run is done *)
+let alias_lines_for ~(seen : (string, unit) Hashtbl.t) content =
+  Hashtbl.fold (fun lemma alias acc ->
+      let coq_id = Lang.lemma_id lemma in
+      if contains_ident content coq_id then begin
+        Hashtbl.replace seen lemma () ;
+        Printf.sprintf "Notation %s := %s." alias coq_id :: acc
+      end else acc)
+    aliases []
+
+(* -------------------------------------------------------------------------- *)
+(* --- Readable hypothesis names (best-effort)                           --- *)
+(* -------------------------------------------------------------------------- *)
+
+(* Why3's own pass-1 skeleton is a single "intros <tok> ... <tok>." line
+   between "Proof." and "Qed."/"Admitted.". Extract its tokens, or [None] if
+   the skeleton isn't in that shape (e.g. a more complex proof structure). *)
+let extract_intros_tokens content =
+  try
+    let goal_pos = before_substring ~start:0 goal_marker content in
+    let proof_end = after_substring ~start:goal_pos "\nProof." content in
+    let stop kw = try Some (before_substring ~start:proof_end kw content)
+      with Not_found -> None in
+    match stop "\nQed.", stop "\nAdmitted." with
+    | None, None -> None
+    | Some i, None | None, Some i | Some i, Some _ ->
+      let skeleton = String.trim (String.sub content proof_end (i - proof_end)) in
+      let len = String.length skeleton in
+      if len < 8 || String.sub skeleton 0 6 <> "intros"
+         || skeleton.[len - 1] <> '.'
+      then None
+      else
+        let body = String.sub skeleton 6 (len - 6 - 1) in
+        let toks =
+          String.split_on_char ' ' body
+          |> List.concat_map (String.split_on_char '\n')
+          |> List.concat_map (String.split_on_char '\t')
+          |> List.filter (fun t -> t <> "")
+        in
+        if toks <> [] && List.for_all valid_coq_ident toks then Some toks
+        else None
+  with Not_found -> None
+
+(* the printed "Theorem wp_goal : <this> ." statement, i.e. everything from
+   the goal marker up to (excluding) "Proof." *)
+let extract_statement content =
+  try
+    let goal_pos = before_substring ~start:0 goal_marker content in
+    let proof_start = before_substring ~start:goal_pos "\nProof." content in
+    Some (String.sub content goal_pos (proof_start - goal_pos))
+  with Not_found -> None
+
+(* number of top-level (paren-depth 0) "->" in a goal statement: each one is
+   exactly one flattened hypothesis, regardless of foralls/lets/parens *)
+let count_top_level_arrows text =
+  let n = String.length text in
+  let rec loop i depth acc =
+    if i >= n then acc
+    else match text.[i] with
+      | '(' -> loop (i + 1) (depth + 1) acc
+      | ')' -> loop (i + 1) (depth - 1) acc
+      | '-' when depth = 0 && i + 1 < n && text.[i + 1] = '>' ->
+        loop (i + 2) depth (acc + 1)
+      | _ -> loop (i + 1) depth acc
+  in
+  loop 0 0 0
+
+(* the ACSL 'requires' name a hypothesis step comes from, if any *)
+let requires_name (p : Property.t) =
+  match p with
+  | Property.IPPredicate { ip_kind = Property.PKRequires _; _ } ->
+    (match Property.get_names p with n :: _ -> Some n | [] -> None)
+  | _ -> None
+
+(* Best-effort "intros" line using the 'requires' clause names instead of
+   Why3's generic h1/h2/... A hypothesis step is renamed when its dependency
+   set (Conditions.step.deps) points to exactly one named 'requires'.
+
+   WP's sequent (Conditions.sequent, via Wpo.compute) is not a literal,
+   position-for-position preimage of the printed forall/-> chain: 'State'
+   steps are memory-model bookkeeping with no printed counterpart, and
+   'Type' steps (is_sintN/is_uintN range facts) are printed *after* the
+   'Have' ones rather than in their internal order. Both are corrected for
+   below. When a goal shares a computed value across hypotheses via a
+   printed "let", Why3 can also introduce extra range hypotheses that never
+   appear in Conditions.sequent at all -- undetectable from the WP side, so
+   as a hard safety net the reconstructed hypothesis count is cross-checked
+   against an independent count of top-level "->" in the printed statement;
+   any mismatch bails out to no renaming at all instead of a wrong one. *)
+let build_auto_intros (wpo : Wpo.t) (raw : string) : string option =
+  match extract_intros_tokens raw, extract_statement raw with
+  | None, _ | _, None -> None
+  | Some tokens, Some statement ->
+    let sequent = snd (Wpo.compute wpo) in
+    let steps = Conditions.list (fst sequent) in
+    let blocking =
+      List.exists
+        (fun (s : Conditions.step) ->
+           match s.Conditions.condition with
+           | Conditions.Branch _ | Conditions.Either _ | Conditions.Probe _ -> true
+           | _ -> false)
+        steps
+    in
+    (* 'Have'-like steps first (their relative order), 'Type' steps after
+       (their relative order) -- matches Why3's printed convention; 'State'
+       steps carry no hypothesis at all and are dropped. *)
+    let group (s : Conditions.step) =
+      match s.Conditions.condition with
+      | Conditions.Have _ | Conditions.When _
+      | Conditions.Core _ | Conditions.Init _ -> Some 0
+      | Conditions.Type _ -> Some 1
+      | Conditions.State _ | Conditions.Branch _
+      | Conditions.Either _ | Conditions.Probe _ -> None
+    in
+    let hyp_steps =
+      List.stable_sort (fun a b -> compare (group a) (group b))
+        (List.filter (fun s -> group s <> None) steps)
+    in
+    let n_steps = List.length hyp_steps and n_tokens = List.length tokens in
+    let n_arrows = count_top_level_arrows statement in
+    if blocking || n_steps = 0 || n_steps > n_tokens || n_arrows <> n_steps
+    then None
+    else
+      let n_lead = n_tokens - n_steps in
+      let arr = Array.of_list tokens in
+      let leading = Array.to_list (Array.sub arr 0 n_lead) in
+      let trailing = Array.to_list (Array.sub arr n_lead n_steps) in
+      let used = Hashtbl.create 7 in
+      List.iter (fun t -> Hashtbl.replace used t ()) leading ;
+      let renamed = ref [] in
+      let trailing' =
+        List.map2
+          (fun tok (step : Conditions.step) ->
+             match List.find_map requires_name step.Conditions.deps with
+             | Some name when valid_coq_ident name && not (Hashtbl.mem used name) ->
+               Hashtbl.replace used name () ;
+               renamed := (tok, name) :: !renamed ;
+               name
+             | _ -> tok)
+          trailing hyp_steps
+      in
+      if !renamed = [] then None
+      else
+        let comment =
+          Printf.sprintf "(* local-tactic intros: %s *)"
+            (String.concat ", "
+               (List.rev_map (fun (tok, name) -> Printf.sprintf "%s -> %s" tok name)
+                  !renamed))
+        in
+        let intros_line =
+          Printf.sprintf "intros %s." (String.concat " " (leading @ trailing'))
+        in
+        Some (comment ^ "\n" ^ intros_line)
+
 (* -------------------------------------------------------------------------- *)
 (* --- Proof pipeline                                                    --- *)
 (* -------------------------------------------------------------------------- *)
@@ -325,12 +575,24 @@ let write_file f s =
   Fun.protect ~finally:(fun () -> close_out_noerr oc)
     (fun () -> output_string oc s)
 
-let resolve_body = function
-  | Inline s -> Some s
+let resolve_segment = function
+  | Lit s -> Some s
   | Ref n ->
     (match Hashtbl.find_opt recipes n with
      | Some s -> Some s
      | None -> Self.warning "unknown rocq_strategy recipe '%s' (skipped)" n ; None)
+
+(* joins a script's segments with "\n"; [None] if any [\by(Name)] segment
+   fails to resolve (already warned about) *)
+let resolve_body (segs : script_body) : string option =
+  let rec go acc = function
+    | [] -> Some (String.concat "\n" (List.rev acc))
+    | seg :: tl ->
+      (match resolve_segment seg with
+       | Some s -> go (s :: acc) tl
+       | None -> None)
+  in
+  go [] segs
 
 (* collect (property, ltac) pairs from every [rocq_script] clause, both on
    statement contracts and on function contracts *)
@@ -453,22 +715,48 @@ let run_pipeline () =
           targets ;
         VC.command (Bag.ulist pass1) ;
 
-        (* splice imports + user script into each generated file *)
+        (* splice imports + rocq_alias notations + user script into each
+           generated file *)
+        let alias_seen : (string, unit) Hashtbl.t = Hashtbl.create 7 in
         List.iter (fun (ip, ltac) ->
             List.iter (fun (wpo : Wpo.t) ->
                 let f = script_file wpo in
-                if Sys.file_exists f then
-                  match splice ~imports ~ltac (read_file f) with
+                if Sys.file_exists f then begin
+                  let raw = read_file f in
+                  let alias_imports = alias_lines_for ~seen:alias_seen raw in
+                  (* don't prepend an auto 'intros' in front of a script that
+                     already starts with one of its own *)
+                  let trimmed = String.trim ltac in
+                  let has_own_intros =
+                    String.length trimmed >= 6
+                    && String.sub trimmed 0 6 = "intros"
+                  in
+                  let ltac =
+                    if has_own_intros then ltac
+                    else
+                      match build_auto_intros wpo raw with
+                      | Some block -> block ^ "\n" ^ ltac
+                      | None -> ltac
+                  in
+                  match splice ~imports:(imports @ alias_imports) ~ltac raw with
                   | Some spliced -> write_file f spliced
                   | None ->
                     Self.warning
                       "%a: unexpected layout in %s, script not spliced"
                       Property.pretty ip f
-                else
+                end else
                   Self.warning "%a: expected Rocq file %s was not generated"
                     Property.pretty ip f)
               (Wpo.goals_of_property ip))
           targets ;
+        Hashtbl.iter
+          (fun lemma alias ->
+             if not (Hashtbl.mem alias_seen lemma) then
+               Self.warning
+                 "rocq_alias: '%s' (lemma '%s') was not applied -- its axiom \
+                  did not appear in any file generated by this run"
+                 alias lemma)
+          aliases ;
 
         (* pass 2: recompile the spliced file(s) as-is *)
         Wp_parameters.Interactive.set "batch" ;
