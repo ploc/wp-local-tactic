@@ -301,6 +301,19 @@ let () =
     "rocq_loop_script"
     rocq_script_typer
     ~printer:(fun _ fmt k -> pp_script_kind fmt k)
+    false ;
+  (* [rocq_assert_script] -- same typer/registry again, this time for a plain
+     'assert'. Written right next to it in the same annotation block, e.g.
+     [assert P; rocq_assert_script("nra");] -- both end up as code
+     annotations attached to the same statement (see WP's own [\wp::probe]
+     for the same pattern), so [collect_targets] just looks for a sibling
+     [AAssert] there. [register_code_annot] ("current program point") is the
+     right registration here, unlike the loop case: an assert's extension is
+     *with* it, not attached to something that follows. *)
+  Acsl_extension.register_code_annot_next_stmt ~plugin:"local-tactic"
+    "rocq_assert_script"
+    rocq_script_typer
+    ~printer:(fun _ fmt k -> pp_script_kind fmt k)
     false
 
 (* -------------------------------------------------------------------------- *)
@@ -664,6 +677,40 @@ let collect_targets () =
                      if keep then out := (ip, ltac) :: !out
                    | _ -> ())
                 (Annotations.code_annot stmt)))
+      | AExtended (_, false, { ext_name = "rocq_assert_script"; ext_kind = Ext_id id; _ }) ->
+        (match Hashtbl.find_opt scripts id with
+         | None -> ()
+         | Some sc ->
+           (match resolve_body sc.body with
+            | None -> ()
+            | Some ltac ->
+              (* an 'assert' is a code annotation like any other, so -- unlike
+                 a loop invariant, which shares its statement's whole
+                 annotation list with 'loop rocq_loop_script' -- each
+                 '/*@ ... */' comment lands on its *own* synthetic statement.
+                 The target is the 'assert' immediately before this one in
+                 the CFG: its sole predecessor, unless a branch/merge sits in
+                 between. *)
+              match stmt.preds with
+              | [ pred ] ->
+                let kf = Kernel_function.find_englobing_kf pred in
+                List.iter
+                  (fun ca2 ->
+                     match ca2.annot_content with
+                     | AAssert _ ->
+                       let ip = Property.ip_of_code_annot_single kf pred ca2 in
+                       let keep =
+                         match sc.label with
+                         | None -> true
+                         | Some l -> List.mem l (Property.get_names ip)
+                       in
+                       if keep then out := (ip, ltac) :: !out
+                     | _ -> ())
+                  (Annotations.code_annot pred)
+              | _ ->
+                Self.warning
+                  "rocq_assert_script (stmt %d) must immediately follow the \
+                   'assert' it targets (skipped)" stmt.sid))
       | _ -> ()) ;
   (* function contracts *)
   Globals.Functions.iter (fun kf ->

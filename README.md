@@ -129,6 +129,13 @@ $ frama-c -wp -local-tactic -local-tactic-rocq-import Lia \
     examples/loop_invariant.c -then -report
 ```
 
+`examples/assert.c` covers a fifth, `rocq_assert_script`, for a plain `assert`:
+
+```console
+$ frama-c -wp -local-tactic -local-tactic-rocq-import Lia \
+    examples/assert.c -then -report
+```
+
 
 Writing annotations
 -------------------
@@ -232,6 +239,37 @@ the other is often closed by WP's own simplifier before Coq is ever
 invoked, with nothing left to splice. The bare `invariant P;` *code*
 annotation (no `loop` prefix — an assertion-style invariant, unrelated to
 any specific loop) is a different ACSL construct and is not targeted.
+
+### `rocq_assert_script` — attach a script to a plain `assert`
+
+A bare `assert` is a *code annotation*, not a behavior clause, so
+`rocq_script` doesn't reach it either. Use `rocq_assert_script`, written in
+its own `/*@ ... */` comment **immediately after** the `assert` it targets:
+
+```c
+/*@ assert sq: n * n >= 0; */
+/*@ rocq_assert_script sq: "nia." ; */
+```
+
+Frama-C allows only one code annotation per comment, so the `assert` and its
+script cannot share a single `/*@ ... */` block the way an `ensures` and
+`rocq_script` can share a behavior, or a `loop invariant` and
+`rocq_loop_script` can share a loop's annotation list — each becomes its own
+statement, and `rocq_assert_script` locates its target as the `assert`
+immediately preceding it in the control-flow graph. This means it must come
+right after the `assert` it targets, with nothing else — not even another
+plain statement — in between; if two `assert`s are stacked back to back, only
+the one directly above the script is reachable, and the (still optional)
+`label:` is then just a sanity check that catches pointing at the wrong one:
+
+```c
+/*@ assert trivial: x == x; */
+/*@ assert nonlinear: x * x >= 0; */
+/*@ rocq_assert_script nonlinear: "nia." ; */   // targets 'nonlinear', not 'trivial'
+```
+
+Without a label, the script applies to whatever single `assert` immediately
+precedes it.
 
 ### Multi-line scripts
 
@@ -361,15 +399,21 @@ is reported as `Valid (Coq)` and consolidated exactly like an Alt-Ergo or Z3
 result — visible to `-wp-status`, `-report`, `-wp-report-json`, the GUI, and any
 downstream consolidation.
 
-**Scope: function and statement contracts, plus loop invariants.** `rocq_script`
-is a *behavior* extension, so it lives among `requires` / `ensures` / `assigns`.
-It is read from both function contracts and statement contracts. Statement
-contracts additionally trigger a pre-existing WP message (`Statement
-specifications not yet supported (skipped)`) and are handled at whole-function
-granularity; function contracts are the cleaner target. `rocq_loop_script` is a
-separate *loop* annotation for the same reason `rocq_proof` is a separate
-*global* one: ACSL won't let a single extension keyword be used at two grammar
-levels, and a loop invariant is neither a behavior clause nor a global.
+**Scope: function and statement contracts, loop invariants, and asserts.**
+`rocq_script` is a *behavior* extension, so it lives among `requires` /
+`ensures` / `assigns`. It is read from both function contracts and statement
+contracts. Statement contracts additionally trigger a pre-existing WP message
+(`Statement specifications not yet supported (skipped)`) and are handled at
+whole-function granularity; function contracts are the cleaner target.
+`rocq_loop_script` is a separate *loop* annotation for the same reason
+`rocq_proof` is a separate *global* one: ACSL won't let a single extension
+keyword be used at two grammar levels, and a loop invariant is neither a
+behavior clause nor a global. `rocq_assert_script` is a plain *code*
+annotation for the same reason again — an `assert` is neither — but unlike
+the other three, each `/*@ ... */` comment becomes its own CIL statement (only
+one code annotation is allowed per comment), so it cannot share its target's
+annotation list the way a `loop rocq_loop_script` shares the loop's; instead
+it locates its target as the `assert` immediately preceding it in the CFG.
 
 **Auto-`intros` naming is reconstructed, not observed, and says so when it
 can't be trusted.** WP exposes a goal's hypotheses as `Conditions.sequent`
@@ -398,9 +442,9 @@ How it executes
 line it runs first; either way the plug-in then drives WP's obligation generator
 and prover interface directly. It collects its targets — the `ensures` properties
 of every contract carrying a `rocq_script` (filtered by label if present), every
-loop invariant named by a `rocq_loop_script`, and every lemma named by a
-`rocq_proof`, with `\by(Name)` resolved against the declared `rocq_strategy`
-recipes — then:
+loop invariant named by a `rocq_loop_script`, every `assert` immediately
+preceding a `rocq_assert_script`, and every lemma named by a `rocq_proof`,
+with `\by(Name)` resolved against the declared `rocq_strategy` recipes — then:
 
 **0. Save and override WP options.** It records and later restores
 `-wp-prover`, `-wp-interactive` and `-wp-status-valid`. It sets the prover to
