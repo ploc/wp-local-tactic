@@ -114,12 +114,19 @@ $ frama-c -wp -local-tactic test.c -then -report
 [  Valid  ] Post-condition 'sq_nonneg2'
 ```
 
-`examples/readable_proofs.c` walks through the three syntax extensions covered below
+`examples/readable_proofs.c` walks through three syntax extensions covered below
 (multi-line scripts, `rocq_alias`, auto-`intros` naming) in one file:
 
 ```console
 $ frama-c -wp -local-tactic -local-tactic-rocq-import ZArith,Lia \
     examples/readable_proofs.c -then -report
+```
+
+`examples/loop_invariant.c` covers a fourth, `rocq_loop_script`:
+
+```console
+$ frama-c -wp -local-tactic -local-tactic-rocq-import Lia \
+    examples/loop_invariant.c -then -report
 ```
 
 
@@ -198,6 +205,33 @@ at two grammar levels — contract clause *and* global annotation.)
 Lemmas are the cleanest target: WP emits exactly one proof obligation per lemma,
 stated as the ACSL predicate itself, with none of the machine-integer or
 `\at`-label hypotheses a contract obligation carries.
+
+### `rocq_loop_script` — attach a script to a loop invariant
+
+A loop invariant is not a behavior clause either (it isn't part of any
+`requires`/`ensures`/`assigns` block), so `rocq_script` doesn't reach it. Use
+`rocq_loop_script`, written with the `loop` keyword right next to `loop
+invariant` / `loop assigns` / `loop variant`:
+
+```c
+/*@ loop invariant inv: 2 * s == i * (i - 1);
+  @ loop rocq_loop_script inv: "nia." ;
+  @ loop assigns i, s;
+  @ loop variant n - i;
+*/
+while (i < n) { s += i; i++; }
+```
+
+Like `rocq_script`, an optional `label:` selects one named invariant among
+several; without one, the script applies to every `loop invariant` on that
+loop (a `for behavior:`-restricted one included). WP splits an invariant
+into up to two proof obligations — "established" (true on entry) and
+"preserved" (true again after one iteration) — and `rocq_loop_script` is
+simply handed to whichever of the two actually needs an interactive prover;
+the other is often closed by WP's own simplifier before Coq is ever
+invoked, with nothing left to splice. The bare `invariant P;` *code*
+annotation (no `loop` prefix — an assertion-style invariant, unrelated to
+any specific loop) is a different ACSL construct and is not targeted.
 
 ### Multi-line scripts
 
@@ -327,12 +361,15 @@ is reported as `Valid (Coq)` and consolidated exactly like an Alt-Ergo or Z3
 result — visible to `-wp-status`, `-report`, `-wp-report-json`, the GUI, and any
 downstream consolidation.
 
-**Scope: function and statement contracts.** `rocq_script` is a *behavior*
-extension, so it lives among `requires` / `ensures` / `assigns`. It is read from
-both function contracts and statement contracts. Statement contracts additionally
-trigger a pre-existing WP message (`Statement specifications not yet supported
-(skipped)`) and are handled at whole-function granularity; function contracts are
-the cleaner target.
+**Scope: function and statement contracts, plus loop invariants.** `rocq_script`
+is a *behavior* extension, so it lives among `requires` / `ensures` / `assigns`.
+It is read from both function contracts and statement contracts. Statement
+contracts additionally trigger a pre-existing WP message (`Statement
+specifications not yet supported (skipped)`) and are handled at whole-function
+granularity; function contracts are the cleaner target. `rocq_loop_script` is a
+separate *loop* annotation for the same reason `rocq_proof` is a separate
+*global* one: ACSL won't let a single extension keyword be used at two grammar
+levels, and a loop invariant is neither a behavior clause nor a global.
 
 **Auto-`intros` naming is reconstructed, not observed, and says so when it
 can't be trusted.** WP exposes a goal's hypotheses as `Conditions.sequent`
@@ -360,9 +397,10 @@ How it executes
 `-local-tactic` registers a Frama-C main action. If `-wp` is also on the command
 line it runs first; either way the plug-in then drives WP's obligation generator
 and prover interface directly. It collects its targets — the `ensures` properties
-of every contract carrying a `rocq_script` (filtered by label if present), and
-every lemma named by a `rocq_proof`, with `\by(Name)` resolved against the
-declared `rocq_strategy` recipes — then:
+of every contract carrying a `rocq_script` (filtered by label if present), every
+loop invariant named by a `rocq_loop_script`, and every lemma named by a
+`rocq_proof`, with `\by(Name)` resolved against the declared `rocq_strategy`
+recipes — then:
 
 **0. Save and override WP options.** It records and later restores
 `-wp-prover`, `-wp-interactive` and `-wp-status-valid`. It sets the prover to
@@ -416,6 +454,11 @@ Limitations
   declared in another part of the file.
 * `rocq_alias` only helps once a lemma is already proved and used as a
   hypothesis elsewhere; it has nothing to alias inside the lemma's own proof.
+* `rocq_loop_script` targets *normal* loop invariants (`loop invariant ...;`,
+  `for behavior: loop invariant ...;`) only, not the unrelated bare
+  `invariant P;` code annotation. Its script is not split between the
+  "established" and "preserved" sub-goals; the same one is used for
+  whichever of the two isn't already closed by WP's own simplifier.
 
 
 Background: what changed from the 2013 version

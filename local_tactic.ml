@@ -291,6 +291,16 @@ let () =
   Acsl_extension.register_behavior ~plugin:"local-tactic" "rocq_script"
     rocq_script_typer
     ~printer:(fun _ fmt k -> pp_script_kind fmt k)
+    false ;
+  (* [rocq_loop_script] shares [rocq_script]'s typer/registry -- a loop
+     invariant is not a behavior clause, so it needs its own keyword
+     (Acsl_extension keys registrations by (plugin, name) alone, regardless
+     of grammar position; the same name can't be registered twice) but the
+     same parsing and storage applies verbatim. *)
+  Acsl_extension.register_code_annot_next_loop ~plugin:"local-tactic"
+    "rocq_loop_script"
+    rocq_script_typer
+    ~printer:(fun _ fmt k -> pp_script_kind fmt k)
     false
 
 (* -------------------------------------------------------------------------- *)
@@ -627,12 +637,33 @@ let collect_targets () =
           bhv.b_extended)
       spec.spec_behavior
   in
-  (* statement contracts *)
+  (* statement contracts, and [rocq_loop_script] on a loop invariant *)
   Annotations.iter_all_code_annot (fun stmt _ ca ->
       match ca.annot_content with
       | AStmtSpec (_, spec) ->
         let kf = Kernel_function.find_englobing_kf stmt in
         scan_spec kf (Kstmt stmt) spec
+      | AExtended (_, true, { ext_name = "rocq_loop_script"; ext_kind = Ext_id id; _ }) ->
+        (match Hashtbl.find_opt scripts id with
+         | None -> ()
+         | Some sc ->
+           (match resolve_body sc.body with
+            | None -> ()
+            | Some ltac ->
+              let kf = Kernel_function.find_englobing_kf stmt in
+              List.iter
+                (fun ca2 ->
+                   match ca2.annot_content with
+                   | AInvariant (_, true (* normal loop invariant *), _) ->
+                     let ip = Property.ip_of_code_annot_single kf stmt ca2 in
+                     let keep =
+                       match sc.label with
+                       | None -> true
+                       | Some l -> List.mem l (Property.get_names ip)
+                     in
+                     if keep then out := (ip, ltac) :: !out
+                   | _ -> ())
+                (Annotations.code_annot stmt)))
       | _ -> ()) ;
   (* function contracts *)
   Globals.Functions.iter (fun kf ->
@@ -744,7 +775,13 @@ let run_pipeline () =
                     Self.warning
                       "%a: unexpected layout in %s, script not spliced"
                       Property.pretty ip f
-                end else
+                end else if Wpo.is_fully_valid wpo then
+                  (* this particular goal (e.g. a loop invariant's
+                     'established' half, next to a harder 'preserved' one)
+                     was already closed by Qed without needing an
+                     interactive prover at all -- nothing to splice *)
+                  ()
+                else
                   Self.warning "%a: expected Rocq file %s was not generated"
                     Property.pretty ip f)
               (Wpo.goals_of_property ip))
